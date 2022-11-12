@@ -1,7 +1,10 @@
 #pragma once
 
+#include <stdexcept>
 #include <vector>
+#include <map>
 #include <fstream>
+#include <numeric>
 #include <Eigen/Dense>
 #include <boost/program_options.hpp>
 #include <boost/filesystem.hpp>
@@ -51,12 +54,17 @@ namespace loradML {
     };
 
     struct ColumnSpec {
-            enum column_t {
-                ignore              = 0,
-                unconstrained       = 1,
-                posterior           = 2,
-                iteration           = 3,
-                unknown             = 4
+            enum column_t {       //   hex          bin  dec
+                ignore              = 0x00, // 00000000    0
+                iteration           = 0x01, // 00000001    1
+                posterior           = 0x02, // 00000010    2
+                unconstrained       = 0x04, // 00000100    4 (counts as parameter)
+                positive            = 0x08, // 00001000    8 (counts as parameter)
+                proportion          = 0x10, // 00010000   16 (counts as parameter)
+                simplex             = 0x20, // 00100000   32 (counts as parameter)
+                simplexfinal        = 0x40, // 01000000   64
+                unknown             = 0x80, // 10000000  128
+                parameter           = 0x3C  // 00111100   60
             };
             
             ColumnSpec() {
@@ -65,21 +73,39 @@ namespace loradML {
             
             ColumnSpec(string t, string nm) {
                 _name = nm;
-                if (t == "unconstrained") {
-                    _coltype = unconstrained;
-                }
-                else if (t == "ignore") {
+                if (t == "ignore") {
                     _coltype = ignore;
-                }
-                else if (t == "posterior") {
-                    _coltype = posterior;
                 }
                 else if (t == "iteration") {
                     _coltype = iteration;
                 }
+                else if (t == "posterior") {
+                    _coltype = posterior;
+                }
+                else if (t == "unconstrained") {
+                    _coltype = unconstrained;
+                }
+                else if (t == "positive") {
+                    _coltype = positive;
+                }
+                else if (t == "proportion") {
+                    _coltype = proportion;
+                }
+                else if (t == "simplex") {
+                    _coltype = simplex;
+                }
+                else if (t == "simplexfinal") {
+                    _coltype = simplexfinal;
+                }
                 else {
                     _coltype = unknown;
                 }
+            }
+            
+            bool isParameter() {
+                int x = _coltype & parameter;
+                bool is_param = (x > 0);
+                return is_param;
             }
             
             unsigned _coltype;
@@ -105,6 +131,7 @@ namespace loradML {
             void                        calcMarginalLikelihood();
             
             bool                        _quiet;
+            bool                        _debug_transformations;
                         
             // Starting and ending samples (first sample is 1). Used for overlapping batch
             // mean (OBM) estimation of Monte Carlo standard error (MCSE).
@@ -147,10 +174,11 @@ namespace loradML {
             double                          _logDetSqrtS;
         
             // Related to reading in the parameter file
+            unsigned                    _skip;                  // burnin lines to skip
             string                      _param_file;            // paramfile in loradML.conf
             vector<string>              _colspecs;              // vector of colspec entries from loradML.conf
             vector<ColumnSpec>          _column_specifications; // vector of ColumnSpec objects
-            vector<string>              _column_names;          // vector column headers
+            vector<string>              _column_names;          // vector column headers (from input file)
             vector<unsigned>            _orig_iter;         // element i is the original MCMC iteration for the ith sample
             vector<double>              _kernel_values;     // element i is the log-kernel of the ith sample
             vector< vector<double> >    _parameter_vectors; // element i is the ith sampled parameter vector
@@ -186,6 +214,7 @@ namespace loradML {
         desc.add_options()
             ("help,h", "produce help message")
             ("version,v", "show program version")
+            ("debugtransformations", program_options::value(&_debug_transformations)->default_value(false), "if yes, provides detailed output for first processed sample line and then quits")
             ("quiet,q", program_options::value(&_quiet)->default_value(false), "if yes, the only output will be the estimated log marginal likelihood")
             ("paramfile", program_options::value(&_param_file)->required(), "name of file containing sampled parameter values")
             ("colspec", program_options::value(&_colspecs), "column specification (provide one for each column in paramfile)")
@@ -193,6 +222,7 @@ namespace loradML {
             ("endsample", program_options::value(&_ending_sample)->default_value(0), "last sample to consider (starting with 1; specify 0 to consider all samples)")
             ("trainingfrac", program_options::value(&_training_fraction)->default_value(0.5), "fraction of sample to use for training (determining rmax and mean vector and covariance matrix for standardization)")
             ("coverage", program_options::value(&_coverage)->default_value(0.25), "fraction of training sample to use for determining rmax")
+            ("skip", program_options::value(&_skip)->default_value(0), "number of sample lines at beginning of paramfile to skip")
         ;
         program_options::store(program_options::parse_command_line(argc, argv, desc), vm);
         try {
@@ -240,6 +270,8 @@ namespace loradML {
             unsigned i = stoi(parts[0]) - 1;
             assert(_column_specifications[i]._coltype == ColumnSpec::unknown);
             _column_specifications[i] = ColumnSpec(parts[1], parts[2]);
+            if (_column_specifications[i]._coltype == ColumnSpec::unknown)
+                throw XLoRaDML(format("colspec named \"%s\" specified an unknown column type (%s)") % parts[2] % parts[1]);
         }
         if (!_quiet) {
             ::om.outputConsole(format("\nProcessed %d column specifications\n") % _colspecs.size());
@@ -271,6 +303,8 @@ namespace loradML {
         string line;
         vector<string> tmp;
         vector<double> tmp_param_vect;
+        //map<string, vector<double> > simplex_workspace;
+        vector<double> simplex_workspace;
         unsigned i = 0;
         while (getline(inf, line)) {
             if (i == 0) {
@@ -280,12 +314,33 @@ namespace loradML {
                 // Determine number of parameters by examining _column_specifications
                 _nparameters = 0;
                 for (auto & cspec : _column_specifications) {
-                    if (cspec._coltype == ColumnSpec::unconstrained)
+                    if (cspec.isParameter())
                         ++_nparameters;
                 }
                 tmp_param_vect.resize(_nparameters);
+                
+                // Ensure that there is a simplexfinal colspec ending each run of simplex colspecs
+                bool in_simplex = false;
+                for (auto & cspec : _column_specifications) {
+                    if (cspec._coltype == ColumnSpec::simplex)
+                        in_simplex = true;
+                    else if (cspec._coltype == ColumnSpec::simplexfinal) {
+                        in_simplex = false;
+                    }
+                    else if (in_simplex) {
+                        // If in_simplex is true, abort because every run of simplex colspecs must end
+                        // with a simplexfinal colspec
+                        throw XLoRaDML(format("A simplexfinal colspec must end every run of simplex colspecs, but one simplex run ended with a colspec named %s") % cspec._name);
+                    }
+                    else {
+                        in_simplex = false;
+                    }
+                }
+                if (!_quiet) {
+                    ::om.outputConsole(format("  Found %d parameters\n") % _nparameters);
+                }
             }
-            else {
+            else if (i > _skip) {
                 // store parameter vector and posterior kernel for this sample
                 
                 // Split line from parameter file into tab-delimited columns
@@ -306,9 +361,12 @@ namespace loradML {
                             it = stoi(tmp[col]);
                         }
                         catch(...) {
-                            throw XLoRaDML(format("Could not convert string \"%s\" in column %d to an integer representing the MCMC iteration for this sample") % tmp[col] % col);
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to an integer representing the MCMC iteration for this sample") % (i+1) % tmp[col] % col);
                         }
                         origiter = it;
+                        
+                        if (_debug_transformations)
+                            ::om.outputConsole(format("%12d iteration\n") % it);
                     }
                     else if (cspec._coltype == ColumnSpec::posterior) {
                         double v = 0.0;
@@ -316,9 +374,12 @@ namespace loradML {
                             v = stod(tmp[col]);
                         }
                         catch(...) {
-                            throw XLoRaDML(format("Could not convert string \"%s\" in column %d to a floating-point posterior kernel compnent") % tmp[col] % col);
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point posterior kernel compnent") % (i+1) % tmp[col] % col);
                         }
                         kernel += v;
+
+                        if (_debug_transformations)
+                            ::om.outputConsole(format("%12.5f %12s %12s log-posterior (kernel is now %g)\n") % v % "" % "" % kernel);
                     }
                     else if (cspec._coltype == ColumnSpec::unconstrained) {
                         double v = 0.0;
@@ -326,18 +387,143 @@ namespace loradML {
                             v = stod(tmp[col]);
                         }
                         catch(...) {
-                            throw XLoRaDML(format("Could not convert string \"%s\" in column %d to a floating-point parameter value") % tmp[col] % col);
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         tmp_param_vect[param++] = v;
+                        
+                        if (_debug_transformations) {
+                            ::om.outputConsole(format("%12.5f %12.5f %12.5f unconstrained (\"%s\") (kernel is now %g)\n") % 0.0 % v % v % cspec._name % kernel);
+                        }
+                    }
+                    else if (cspec._coltype == ColumnSpec::positive) {
+                        double v = 0.0;
+                        try {
+                            v = stod(tmp[col]);
+                            if (v <= 0.0)
+                                throw runtime_error("expecting strictly postive parameter value");
+                        }
+                        catch(...) {
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
+                        }
+                        
+                        // Peform log transformation
+                        double logv = log(v);
+                        
+                        // Add the log-Jacobian to the kernel
+                        kernel += logv;
+                        
+                        tmp_param_vect[param++] = logv;
+
+                        if (_debug_transformations)
+                            ::om.outputConsole(format("%12.5f %12.5f %12.5f positive (\"%s\") (kernel is now %g)\n") % logv % v % logv % cspec._name % kernel);
+                    }
+                    else if (cspec._coltype == ColumnSpec::proportion) {
+                        double p = 0.0;
+                        try {
+                            p = stod(tmp[col]);
+                            if (p <= 0.0)
+                                throw runtime_error("expecting parameter value in interval (0,1)");
+                            if (p >= 1.0)
+                                throw runtime_error("expecting parameter value in interval (0,1)");
+                        }
+                        catch(...) {
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
+                        }
+                        
+                        // Peform logit transformation
+                        double logitp = log(p) - log(1.0 - p);
+                        
+                        // Add the log-Jacobian to the kernel
+                        kernel += log(p);
+                        kernel += log(1.0 - p);
+                        
+                        tmp_param_vect[param++] = logitp;
+
+                        if (_debug_transformations)
+                            ::om.outputConsole(format("%12.5f %12.5f %12.5f proportion (\"%s\") (kernel is now %g)\n") % (log(p) + log(1.0 - p)) % p % logitp % cspec._name % kernel);
+                    }
+                    else if (cspec._coltype == ColumnSpec::simplex) {
+                        double v = 0.0;
+                        try {
+                            v = stod(tmp[col]);
+                            if (v <= 0.0)
+                                throw runtime_error("expecting parameter value in interval (0,1)");
+                            if (v >= 1.0)
+                                throw runtime_error("expecting parameter value in interval (0,1)");
+                        }
+                        catch(...) {
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
+                        }
+
+                        // Add value to simplex_workspace vector having key equal to cspec._name
+                        //simplex_workspace[cspec._name].push_back(v);
+                        simplex_workspace.push_back(v);
+                    }
+                    else if (cspec._coltype == ColumnSpec::simplexfinal) {
+                        double finalv = 0.0;
+                        try {
+                            finalv = stod(tmp[col]);
+                            if (finalv < 0.0)
+                                throw runtime_error("expecting parameter value in interval [0,1]");
+                            if (finalv > 1.0)
+                                throw runtime_error("expecting parameter value in interval [0,1]");
+                        }
+                        catch(...) {
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
+                        }
+                        
+                        // Ensure that sum is within 0.0001 of 1.0
+                        //vector<double> & w = simplex_workspace[cspec._name];
+                        //double simplex_sum = finalv + accumulate(w.begin(), w.end(), 0.0);
+                        double simplex_sum = finalv + accumulate(simplex_workspace.begin(), simplex_workspace.end(), 0.0);
+                        if (fabs(simplex_sum - 1.0) > 0.0001)
+                            throw XLoRaDML(format("in line %d, simplex components for \"%s\" sum to %g but should sum to 1.0") % (i+1) % cspec._name % simplex_sum);
+                            
+                        // Use final element as reference to perform log-ratio transformation
+                        double logfinalv = log(finalv);
+
+                        for (auto & v : simplex_workspace) {
+                            // Peform log transformation
+                            double logv = log(v);
+                        
+                            // Add the log-Jacobian to the kernel
+                            kernel += logv;
+                        
+                            tmp_param_vect[param++] = logv - logfinalv;
+
+                            if (_debug_transformations) {
+                                ::om.outputConsole(format("%12.5f %12.5f %12.5f simplex (\"%s\") (kernel is now %g)\n") % logv % v % (logv - logfinalv) % cspec._name % kernel);
+                            }
+                        }
+                        
+                        kernel += logfinalv;
+                        if (_debug_transformations) {
+                            ::om.outputConsole(format("%12.5f %12.5f %12.5f simplexfinal (\"%s\") (kernel is now %g)\n") % logfinalv % finalv %  logfinalv % cspec._name % kernel);
+                        }
+
+                        // Clean out workspace vector so that next iteration does not add to it
+                        //w.clear();
+                        simplex_workspace.resize(0);
                     }
                     ++col;
                 }
                 
+                if (_debug_transformations) {
+                    ::om.outputConsole("\nParameter vector:\n");
+                    unsigned j = 0;
+                    for (auto x : tmp_param_vect) {
+                        ::om.outputConsole(format("%12d %12.5f\n") % (++j) % x);
+                    }
+                    cerr << "\nAborted (set debugtransformations = no in loradml.conf file to avoid this)\n" << endl;
+                    exit(0);
+                }
+                    
                 // Can now store origiter, kernel, and the parameter vector
                 _orig_iter.push_back(origiter);
                 _kernel_values.push_back(kernel);
                 _parameter_vectors.push_back(tmp_param_vect);
             }
+            
             ++i;
         }
         
@@ -496,8 +682,8 @@ namespace loradML {
         assert(nretained > 1);
         
         double _rmax = _training_sample[nretained]._norm;
-
-        //::om.outputConsole(boost::format("  _rmax = %.5f\n") % _rmax);
+        if (!_quiet)
+            ::om.outputConsole(boost::format("  rmax = %.5f\n") % _rmax);
         
         // Determine Delta, the integral from 0.0 to _rmax of the
         // marginal distribution of radial vector lengths of a multivariate
@@ -515,6 +701,7 @@ namespace loradML {
         // standard normal density as the reference
         double log_mvnorm_constant = 0.5*p*log(2.*M_PI) + 1.0*p*log(sigma);
         std::vector<double> log_ratios;
+        //std::vector<double> log_inv_ratios;
         for (unsigned i = 0; i < _nestimation; ++i) {
             double norm = _estimation_sample[i]._norm;
             if (norm > _rmax)
@@ -523,13 +710,22 @@ namespace loradML {
             double log_reference = -0.5*sigma_squared*pow(norm,2.0) - log_mvnorm_constant;
             double log_ratio = log_reference - log_kernel;
             log_ratios.push_back(log_ratio);
+            //log_inv_ratios.push_back(-1.0*log_ratio);
         }
         
+        if (log_ratios.size() == 0) {
+            throw XLoRaDML("Zero samples fall inside working parameter space; try increasing coverage fraction");
+        }
         double log_sum_ratios = calcLogSum(log_ratios);
+        //double log_sum_inv_ratios = calcLogSum(log_inv_ratios);
         double log_marginal_likelihood = log_Delta - (log_sum_ratios - log(_nestimation));
         
-        //::om.outputConsole(format("  no. samples used = %d\n") % log_ratios.size());
-        //::om.outputConsole(format("  fraction used = %.5f\n") % (1.0*log_ratios.size()/_nestimation));
+        if (!_quiet) {
+            ::om.outputConsole(format("  no. samples used = %d\n") % log_ratios.size());
+            ::om.outputConsole(format("  nominal coverage = %.5f\n") % _coverage);
+            ::om.outputConsole(format("  actual coverage  = %.5f\n") % (1.0*log_ratios.size()/_nestimation));
+            //::om.outputConsole(format("  avg. log inv. ratio estimator = %.5f\n") % (log_sum_inv_ratios - log(_nestimation)));
+        }
         ::om.outputConsole(format("log marginal likelihood = %.5f\n") % log_marginal_likelihood);
     }
     

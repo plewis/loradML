@@ -1,0 +1,50 @@
+#NEXUS 
+
+Begin trees;  [Treefile saved Fri Nov 11 11:51:45 2022]
+[!
+>Data file = green5.nex
+>Exhaustive search settings:
+>  Optimality criterion = likelihood
+>    All characters have equal weight
+>    Likelihood settings:
+>                  DNA substitution types = 6
+>                       Exchangeabilities = estimated
+>             GTR submodel classification = unrestricted
+>                       State frequencies = estimated
+>          Proportion of invariable sites = estimated
+>                 Rates at variable sites = gamma, shape=estimated (4 categories [mean])
+>                    Model correspondence = GTR+I+G
+>
+>      Number of distinct data patterns under this model = 185
+>      Molecular clock not enforced
+>      Starting branch lengths obtained using Rogers-Swofford approximation method
+>      Trees with approximate log likelihoods 5% or further from the target score are rejected without additional iteration
+>      Branch-length optimization = one-dimensional Newton-Raphson with pass limit=20, tolerance=1e-07
+>      Multidimensional optimizer = Praxis (tol=0.0001)
+>      Likelihood calculations performed in single precision
+>      Vector processing enabled
+>      Using standard Felsenstein pruning for computing likelihoods
+>      Conditional-likelihood rescaling threshold = 1e-20
+>
+>  Initial 'Maxtrees' setting = 100
+>  Branches collapsed (creating polytomies) if branch length is less than or equal to 1e-08
+>  'MulTrees' option in effect
+>  No topological constraints in effect
+>  Trees are unrooted
+>
+>Exhaustive search completed:
+>  Number of trees evaluated = 15
+>  Score of best tree found = 4399.631
+>  Score of worst tree found = 4413.255
+>  Number of trees retained = 1
+>  Time used = 2.39 sec (CPU time = 2.39 sec)
+]
+	Translate
+		1 Chara_connivens_L13476,
+		2 Sphagnum_palustre_L13485,
+		3 Asplenium_nidus_AF525270,
+		4 Picea_pungens_AF456382,
+		5 Avena_sativa_L15300
+		;
+tree 'PAUP_1' = [&U] (1:0.332011,2:0.080500,(3:0.245994,(4:0.090307,5:0.156281):0.031583):0.045325);
+End;
