@@ -17,9 +17,9 @@ namespace loradML {
                   OutputManager();
                   ~OutputManager();
             
-            void   outputConsole() const;
-            void   outputConsole(const string & s) const;
-            void   outputConsole(const format & fmt) const;
+            void   outputNewline(bool flush = false) const;
+            void   outputConsole(const string & s, bool flush = false) const;
+            void   outputConsole(const format & fmt, bool flush = false) const;
             void   outputConsole(const program_options::options_description & description) const;
     };
     
@@ -29,16 +29,22 @@ namespace loradML {
     inline OutputManager::~OutputManager() {
     }
 
-    inline void OutputManager::outputConsole() const {
+    inline void OutputManager::outputNewline(bool flush) const {
         cout << endl;
+        if (flush)
+            cout.flush();
     }
     
-    inline void OutputManager::outputConsole(const string & s) const {
+    inline void OutputManager::outputConsole(const string & s, bool flush) const {
         cout << s;
+        if (flush)
+            cout.flush();
     }
     
-    inline void OutputManager::outputConsole(const format & fmt) const {
+    inline void OutputManager::outputConsole(const format & fmt, bool flush) const {
         cout << str(fmt);
+        if (flush)
+            cout.flush();
     }
     
     inline void OutputManager::outputConsole(const program_options::options_description & description) const {

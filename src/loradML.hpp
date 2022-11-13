@@ -123,12 +123,13 @@ namespace loradML {
             
         private:
         
+            void                        setup();
             double                      calcLogSum(const std::vector<double> & logx_vect);
             void                        readParamFile();
             void                        handleColSpecs();
-            void                        partitionSample();
+            void                        partitionSample(unsigned start_index, unsigned end_index);
             void                        standardizeParameters();
-            void                        calcMarginalLikelihood();
+            double                      calcMarginalLikelihood(bool verbose = true);
             
             bool                        _quiet;
             bool                        _debug_transformations;
@@ -152,17 +153,12 @@ namespace loradML {
             
             // Parameter vectors
             unsigned                        _nsamples_total; // number of samples stored in parameter file
-            unsigned                        _ntraining;      // number of samples used for training
-            unsigned                        _nestimation;    // number of samples used for estimation
-            unsigned                        _nsamples;       // _ntraining + _nestimation
             unsigned                        _nparameters;    // number of free parameters
             std::vector< ParameterSample >  _training_sample;
             std::vector< ParameterSample >  _estimation_sample;
 
             unsigned                        _first_index;   // index of first parameter sample used
             unsigned                        _last_index;    // one beyond index of last parameter sample
-            unsigned                        _boundary;      // index of parameter sample at boundary between
-                                                            // training and estimation samples
                                                             
             // Standardization
             typedef Eigen::VectorXd eigenVectorXd_t;
@@ -172,9 +168,16 @@ namespace loradML {
             eigenMatrixXd_t                 _sqrtS;
             eigenMatrixXd_t                 _invSqrtS;
             double                          _logDetSqrtS;
+            
+            // MCSE calculation
+            bool                        _mcse;     // determines whether to estimate MCSE
+            unsigned                    _T;        // sample size
+            unsigned                    _B;        // batch size
+            unsigned                    _nbatches; // number of batches
+            double                      _TBratio;  // ratio of sample size (T) to batch size (B)
+            unsigned                    _minimum_batch_size;
         
             // Related to reading in the parameter file
-            unsigned                    _skip;                  // burnin lines to skip
             string                      _param_file;            // paramfile in loradML.conf
             vector<string>              _colspecs;              // vector of colspec entries from loradML.conf
             vector<ColumnSpec>          _column_specifications; // vector of ColumnSpec objects
@@ -198,14 +201,15 @@ namespace loradML {
 
     inline void LoRaDML::clear() {
         _nsamples_total = 0;
-        _ntraining = 0;
-        _nestimation = 0;
-        _nsamples = 0;
         _nparameters = 0;
         _first_index = 0;
         _last_index = 0;
-        _boundary = 0;
         _rmax = 0.0;
+        _quiet = false;
+        _mcse = false;
+        _TBratio = 10.0;
+        _debug_transformations = false;
+        _minimum_batch_size = 200;
     }
     
     inline void LoRaDML::processCommandLineOptions(int argc, const char * argv[]) {
@@ -214,15 +218,16 @@ namespace loradML {
         desc.add_options()
             ("help,h", "produce help message")
             ("version,v", "show program version")
-            ("debugtransformations", program_options::value(&_debug_transformations)->default_value(false), "if yes, provides detailed output for first processed sample line and then quits")
-            ("quiet,q", program_options::value(&_quiet)->default_value(false), "if yes, the only output will be the estimated log marginal likelihood")
+            ("debugtransformations,d", program_options::bool_switch(&_debug_transformations), "if supplied, provides detailed output for first processed sample line and then quits")
+            ("quiet,q", program_options::bool_switch(&_quiet), "if supplied, the only output will be the estimated log marginal likelihood (and possibly MCSE)")
             ("paramfile", program_options::value(&_param_file)->required(), "name of file containing sampled parameter values")
             ("colspec", program_options::value(&_colspecs), "column specification (provide one for each column in paramfile)")
             ("startsample", program_options::value(&_starting_sample)->default_value(0), "first sample to consider (starting with 1; specify 0 to consider all samples)")
             ("endsample", program_options::value(&_ending_sample)->default_value(0), "last sample to consider (starting with 1; specify 0 to consider all samples)")
-            ("trainingfrac", program_options::value(&_training_fraction)->default_value(0.5), "fraction of sample to use for training (determining rmax and mean vector and covariance matrix for standardization)")
-            ("coverage", program_options::value(&_coverage)->default_value(0.25), "fraction of training sample to use for determining rmax")
-            ("skip", program_options::value(&_skip)->default_value(0), "number of sample lines at beginning of paramfile to skip")
+            ("trainingfrac,t", program_options::value(&_training_fraction)->default_value(0.5), "fraction of sample to use for training (determining rmax and mean vector and covariance matrix for standardization)")
+            ("coverage,c", program_options::value(&_coverage)->default_value(0.25), "fraction of training sample to use for determining rmax")
+            ("mcse,m", program_options::bool_switch(&_mcse), "if specified, use overlapping batch statistics to estimate Monte Carlo standard error.")
+            ("tbratio", program_options::value(&_TBratio)->default_value(10.0), "ratio of total sample size to (overlapping) batch sample size (e.g. 10.0) for estimating Monte Carlo standard error.")
         ;
         program_options::store(program_options::parse_command_line(argc, argv, desc), vm);
         try {
@@ -237,7 +242,7 @@ namespace loradML {
         // If user specified --help on command line, output usage summary and quit
         if (vm.count("help") > 0) {
             ::om.outputConsole(desc);
-            ::om.outputConsole();
+            ::om.outputNewline();
             exit(1);
         }
 
@@ -254,6 +259,16 @@ namespace loradML {
         else {
             ::om.outputConsole("Please provide one colspec entry for each column in paramfile");
             exit(1);
+        }
+        
+        // Bail out if user specified a crazy value for mcseratio
+        if (vm.count("mcse") > 0) {
+            if (_TBratio < 5.0) {
+                ::om.outputConsole(format("Warning: recommended tbratio is 10-20; you specified %g\n") % _TBratio);
+            }
+            else if (_TBratio < 1.0) {
+                throw XLoRaDML("Cannot specify tbratio less than 1 (10-20 is recommended)");
+            }
         }
     }
     
@@ -273,9 +288,6 @@ namespace loradML {
             if (_column_specifications[i]._coltype == ColumnSpec::unknown)
                 throw XLoRaDML(format("colspec named \"%s\" specified an unknown column type (%s)") % parts[2] % parts[1]);
         }
-        if (!_quiet) {
-            ::om.outputConsole(format("\nProcessed %d column specifications\n") % _colspecs.size());
-        }
     }
     
     inline double LoRaDML::calcLogSum(const std::vector<double> & logx_vect) {
@@ -290,7 +302,7 @@ namespace loradML {
     
     inline void LoRaDML::readParamFile() {
         if (!_quiet) {
-            ::om.outputConsole(format("Reading sampled parameters from file \"%s\"\n") % _param_file);
+            ::om.outputConsole("\nReading parameter sample file...\n");
         }
 
         // Initializations
@@ -336,11 +348,8 @@ namespace loradML {
                         in_simplex = false;
                     }
                 }
-                if (!_quiet) {
-                    ::om.outputConsole(format("  Found %d parameters\n") % _nparameters);
-                }
             }
-            else if (i > _skip) {
+            else {
                 // store parameter vector and posterior kernel for this sample
                 
                 // Split line from parameter file into tab-delimited columns
@@ -532,70 +541,58 @@ namespace loradML {
             throw XLoRaDML("  File seems to be empty or does not comprise columns of numbers");
         }
         if (!_quiet) {
+            ::om.outputConsole(format("  Processed %d column specifications\n") % _colspecs.size());
+            ::om.outputConsole(format("  Found %d parameters\n") % _nparameters);
             ::om.outputConsole(format("  Found %d columns\n") % _column_names.size());
+            ::om.outputConsole(format("  File has %d lines\n") % i);
             ::om.outputConsole(format("  Found %d values for each column\n") % _orig_iter.size());
         }
     }
     
-    inline void LoRaDML::partitionSample() {
-        // Determine total number of samples
-        _nsamples_total = (unsigned)_orig_iter.size();
-        assert(_nsamples_total > 0);
-        
+    inline void LoRaDML::partitionSample(unsigned start_index, unsigned end_index) {
+        if (!_quiet) {
+            ::om.outputConsole("\nPartitioning samples into training and estimation fraction...\n");
+        }
+
         // Allocate _training_sample and _estimation_sample
         //
+        //   Sample size is nsamples = 9
         //   1    2    3    4    5    6    7    8    9
-        //   |                                       |
-        //   _starting_sample                        _ending_sample
         //
         //   0    1    2    3    4    5    6    7    8    9
         //   |                        |                   |
-        //   _first_index             _boundary           _last_index
+        //   start_index              boundary            end_index
         //
-        //   _trainingfrac = 0.5
-        //   _boundary = ceiling(0.5*9)) = 5
-        //   _ntraining   = 5 - 0 = 5
-        //   _nestimation = 9 - 5 = 4
-        //   _nsamples    = 9 - 0 = 9
-        _first_index = (_starting_sample == 0 ? 0 : _starting_sample - 1);
-        _last_index  = (_ending_sample == 0 ? _nsamples_total : _ending_sample);
-        _nsamples    = _last_index - _first_index;
-        _boundary    = _first_index + int(ceil(_training_fraction*_nsamples));
-        _ntraining   = _boundary - _first_index;
-        _nestimation = _last_index - _boundary;
-        
-        // cerr << "debugging: _starting_sample   = " << _starting_sample << endl;
-        // cerr << "debugging: _ending_sample     = " << _ending_sample << endl;
-        // cerr << "debugging: _training_fraction = " << _training_fraction << endl;
-        // cerr << "debugging: _first_index       = " << _first_index << endl;
-        // cerr << "debugging: _last_index        = " << _last_index << endl;
-        // cerr << "debugging: _nsamples          = " << _nsamples << endl;
-        // cerr << "debugging: _boundary          = " << _boundary << endl;
-        // cerr << "debugging: _ntraining         = " << _ntraining << endl;
-        // cerr << "debugging: _nestimation       = " << _nestimation << endl;
-    
+        unsigned nsamples    = end_index - start_index;
+        unsigned boundary    = start_index + (unsigned)(ceil(_training_fraction*nsamples));
+        unsigned ntraining   = boundary - start_index;
+        unsigned nestimation = end_index - boundary;
+            
         // Store training sample
-        _training_sample.resize(_ntraining);
+        _training_sample.resize(ntraining);
         unsigned j = 0;
-        for (unsigned i = _first_index; i < _boundary; i++) {
+        for (unsigned i = start_index; i < boundary; i++) {
             _training_sample[j++].init(_orig_iter[i], i, _kernel_values[i], 0.0, _parameter_vectors[i]);
         }
         
         // Store estimation sample
-        _estimation_sample.resize(_nestimation);
+        _estimation_sample.resize(nestimation);
         j = 0;
-        for (unsigned i = _boundary; i < _last_index; i++) {
+        for (unsigned i = boundary; i < end_index; i++) {
             _estimation_sample[j++].init(_orig_iter[i], i, _kernel_values[i], 0.0, _parameter_vectors[i]);
         }
         
         if (!_quiet) {
-            ::om.outputConsole(format("  Sample (%d) partitioned into training (%d) and estimation sets (%d)\n") % _nsamples % _ntraining % _nestimation);
+            ::om.outputConsole(format("  Sample size is %d\n") % nsamples);
+            ::om.outputConsole(format("  Training sample size is %d\n") % ntraining);
+            ::om.outputConsole(format("  Estimation sample size is %d\n") % nestimation);
         }
     }
     
     inline void LoRaDML::standardizeParameters() {
-        if (!_quiet)
-            ::om.outputConsole("  Standardizing parameters...\n");
+        if (!_quiet) {
+            ::om.outputConsole("\nProcessing training sample...\n");
+        }
                 
         // Zero the mean vector (_mean_transformed)
         assert(_nparameters > 0);
@@ -606,13 +603,12 @@ namespace loradML {
         _S = eigenMatrixXd_t::Zero(_nparameters, _nparameters);
         
         // Calculate mean vector _mean_transformed
-        assert(_ntraining == (unsigned)_training_sample.size());
-        assert(_ntraining > 1);
+        unsigned ntraining = (unsigned)_training_sample.size();
         for (auto & v : _training_sample) {
             // Add v._param_vect elementwise to _mean_transformed
             _mean_transformed += v._param_vect;
         }
-        _mean_transformed /= _ntraining;
+        _mean_transformed /= ntraining;
         
         // Sanity check
         assert(_mean_transformed.rows() == _nparameters);
@@ -622,7 +618,7 @@ namespace loradML {
             eigenVectorXd_t x = v._param_vect - _mean_transformed;
             _S += x*x.transpose();
         }
-        _S /= _ntraining - 1;
+        _S /= ntraining - 1;
         
         // Compute eigenvalues and eigenvectors of _S. Can use an efficient
         // eigensystem solver because S is positive definite and symmetric
@@ -676,14 +672,17 @@ namespace loradML {
         std::sort(_estimation_sample.begin(), _estimation_sample.end(), std::less<ParameterSample>());
     }
     
-    inline void LoRaDML::calcMarginalLikelihood() {
+    inline double LoRaDML::calcMarginalLikelihood(bool verbose) {
         // Determine how many sample vectors to use for working parameter space
-        unsigned nretained = (unsigned)floor(_coverage*_ntraining);
+        unsigned ntraining = (unsigned)_training_sample.size();
+        unsigned nretained = (unsigned)floor(_coverage*ntraining);
         assert(nretained > 1);
         
         double _rmax = _training_sample[nretained]._norm;
-        if (!_quiet)
-            ::om.outputConsole(boost::format("  rmax = %.5f\n") % _rmax);
+        if (!_quiet) {
+            ::om.outputConsole(boost::format("  Lowest radial distance is %.5f\n") % _rmax);
+            ::om.outputConsole("\nProcessing estimation sample...\n");
+        }
         
         // Determine Delta, the integral from 0.0 to _rmax of the
         // marginal distribution of radial vector lengths of a multivariate
@@ -702,7 +701,8 @@ namespace loradML {
         double log_mvnorm_constant = 0.5*p*log(2.*M_PI) + 1.0*p*log(sigma);
         std::vector<double> log_ratios;
         //std::vector<double> log_inv_ratios;
-        for (unsigned i = 0; i < _nestimation; ++i) {
+        unsigned nestimation = (unsigned)_estimation_sample.size();
+        for (unsigned i = 0; i < nestimation; ++i) {
             double norm = _estimation_sample[i]._norm;
             if (norm > _rmax)
                 break;
@@ -718,27 +718,80 @@ namespace loradML {
         }
         double log_sum_ratios = calcLogSum(log_ratios);
         //double log_sum_inv_ratios = calcLogSum(log_inv_ratios);
-        double log_marginal_likelihood = log_Delta - (log_sum_ratios - log(_nestimation));
+        double log_marginal_likelihood = log_Delta - (log_sum_ratios - log(nestimation));
         
         if (!_quiet) {
-            ::om.outputConsole(format("  no. samples used = %d\n") % log_ratios.size());
-            ::om.outputConsole(format("  nominal coverage = %.5f\n") % _coverage);
-            ::om.outputConsole(format("  actual coverage  = %.5f\n") % (1.0*log_ratios.size()/_nestimation));
-            //::om.outputConsole(format("  avg. log inv. ratio estimator = %.5f\n") % (log_sum_inv_ratios - log(_nestimation)));
+            ::om.outputConsole(format("  Number of samples used is %d\n") % log_ratios.size());
+            ::om.outputConsole(format("  Nominal coverage is %.5f\n") % _coverage);
+            ::om.outputConsole(format("  Actual coverage is %.5f\n") % (1.0*log_ratios.size()/nestimation));
+            //::om.outputConsole(format("  avg. log inv. ratio estimator = %.5f\n") % (log_sum_inv_ratios - log(nestimation)));
         }
-        ::om.outputConsole(format("log marginal likelihood = %.5f\n") % log_marginal_likelihood);
+        
+        if (verbose)
+            ::om.outputConsole(format("  Log marginal likelihood is %.5f\n") % log_marginal_likelihood);
+            
+        return log_marginal_likelihood;
+    }
+    
+    inline void LoRaDML::setup() {
+        // Example:
+        // T/B       = 5
+        // T         = 11.0
+        // B         = floor(2.2) = 2.0
+        // T - B + 1 = 10 batches
+        //
+        //      0  1  2  3  4  5  6  7  8  9  10
+        //  1   0  1
+        //  2      1  2
+        //  3         2  3
+        //  4            3  4
+        //  5               4  5
+        //  6                  5  6
+        //  7                     6  7
+        //  8                        7  8
+        //  9                           8  9
+        // 10                              9  10
+        //
+        _nsamples_total = (unsigned)_orig_iter.size();
+        if (_starting_sample > _nsamples_total) {
+            throw XLoRaDML(format("you specified startsample = %d but there are only %d samplea in the file") % _starting_sample % _nsamples_total);
+        }
+        if (_ending_sample > _nsamples_total) {
+            throw XLoRaDML(format("you specified endsample = %d but there are only %d samplea in the file") % _ending_sample % _nsamples_total);
+        }
+        _first_index = (_starting_sample == 0 ? 0 : _starting_sample - 1);
+        _last_index  = (_ending_sample == 0 ? _nsamples_total : _ending_sample);
+        _T = _last_index - _first_index;
+        if (_mcse) {
+            _B = (unsigned)(floor((float)_T/_TBratio));
+        
+            // sanity check
+            if (_B < _minimum_batch_size)
+                throw XLoRaDML(format("batch size < %d for T = %d and specified T/B ratio (%.3f)") % _minimum_batch_size % _T % _TBratio);
+                
+            _nbatches = _T - _B + 1;
+        }
     }
     
     inline void LoRaDML::run() {
         if (!_quiet) {
             ::om.outputConsole(format("This is %s (ver. %d.%d)\n") % _program_name % _major_version % _minor_version);
+            ::om.outputConsole(format("  Parameter sample file is \"%s\"\n") % _param_file);
+            ::om.outputConsole(format("  Training fraction is %.5f\n") % _training_fraction);
+            ::om.outputConsole(format("  Coverage specified is %.5f\n") % _coverage);
+            ::om.outputConsole(format("  Starting sample is %d\n") % _starting_sample);
+            ::om.outputConsole(format("  Ending sample is %d\n") % _ending_sample, true);
+            ::om.outputConsole(format("  MCSE calculation requested: %s\n") % (_mcse ? "yes" : "no"));
+            if (_mcse)
+                ::om.outputConsole(format("    T/B ratio requested: %.1f\n") % _TBratio);
         }
         
         // Read parameter file
         readParamFile();
         
         // Populate _training_sample and _estimation_sample
-        partitionSample();
+        setup();
+        partitionSample(_first_index, _last_index);
         
         // Use _training_sample to determine _rmax, _mean_vector, and _covariance_matrix
         // and then use those to standardize and filter the _estimation_sample
@@ -746,6 +799,55 @@ namespace loradML {
         
         // Use _standardized_sample to estimate the marginal likelihood
         calcMarginalLikelihood();
+
+        if (_mcse) {
+            if (!_quiet) {
+                double fT = (float)_T;
+                double fB = (float)_B;
+                double TBratio = fT/fB;
+                ::om.outputConsole("\nEstimating MCSE...\n");
+                ::om.outputConsole(format("  Total sample size T is %d\n") % _T);
+                ::om.outputConsole(format("  Batch size B is %d\n") % _B);
+                ::om.outputConsole(format("  Realized T/B ratio is %.1f\n") % TBratio);
+                ::om.outputConsole(format("  Number of batches is %d\n") % _nbatches);
+            }
+            _quiet = true;
+            
+            vector<double> eta(_nbatches, 0.0);
+            
+            //::om.outputConsole("\nCalculating MCSE...\n", true);
+            for (unsigned b = 0; b < _nbatches; b++) {
+                //unsigned b1 = b + 1;
+                //if (b1 % 1000 == 0) {
+                //    double bpct = 100.0*b1/_nbatches;
+                //    ::om.outputConsole(format("%12d of %d (%.1f%%)\n") % b1 % _nbatches % bpct, true);
+                //}
+                unsigned start_at = _first_index + b;
+                unsigned end_at = start_at + _B;
+                
+                // Populate _training_sample and _estimation_sample
+                partitionSample(start_at, end_at);
+                
+                // Use _training_sample to determine _rmax, _mean_vector, and _covariance_matrix
+                // and then use those to standardize and filter the _estimation_sample
+                standardizeParameters();
+                
+                // Use _standardized_sample to estimate the marginal likelihood
+                double log_marg_like = calcMarginalLikelihood(false);
+                eta[b] = log_marg_like;
+            }
+            
+            double mean_eta = accumulate(eta.begin(), eta.end(), 0.0)/_nbatches;
+            double mean_square = 0.0;
+            for (auto x : eta) {
+                mean_square += pow(x - mean_eta, 2.);
+            }
+            mean_square *= float(_B);
+            mean_square /= float(_T - _B);
+            mean_square /= float(_T - _B + 1);
+            double MCSE = sqrt(mean_square);
+            ::om.outputConsole(format("  MCSE is %.5f\n") % MCSE);
+        }
     }
 
 }   // namespace loradML

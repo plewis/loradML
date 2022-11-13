@@ -49,8 +49,9 @@ You will note that the *parameter_samples.log* file has more than 17 columns. We
 Here is the _loradml.conf_ file for this example:
 
 ```
+# Comments begin with a hash symbol
 paramfile = posterior_samples.log
-skip = 1
+startsample = 2
 trainingfrac = 0.5
 coverage = 0.5
 
@@ -94,7 +95,7 @@ colspec= 36 positive     tree_length
 
 The first line is straightforward, specifying the name of the sample file to process as the setting `paramfile`. 
 
-The `skip` setting says to skip the first sample (this is just the starting state and is not a valid sample from the posterior distribution). 
+The `startsample` setting says to start with the second sample (the first sample in the file is just the starting state and is not a valid sample from the posterior distribution). There is a corresponding `endsample` that can be used to specify the last sample included. If `startsample` is not specified or is set to 0, the first sample included will be sample 1. If `endsample` is not specified or is set to 0, the last sample included will be the final sample in the file. 
 
 I will talk about the settings `trainingfrac` and `coverage` after explaining the `colspec` entries.
 
@@ -122,11 +123,13 @@ On the training sample, LoRaD performs individual parameter transformations, est
 
 The mean vector and covariance matrix calculated from the training fraction are used to standardize the transformed sample vectors in the estimation sample. Because the mean vector is determined from the training sample and not from the estimation sample, the estimation sample will not be exactly centered over the origin. The estimation sample is sorted from low to high distance (radius) from the origin and only estimation sample vectors that are closer to the origin than the cutoff value rmax (calculated from the training sample) are used.
 
-To run loradML, simply invoke it in the same directory as the _loradml.conf_ file and the RevBayes parameter file. 
+You can easily modify the _green5.Rev_ script to conduct a Steppingstone analysis, which will return a log marginal likelihood very close to the value reported by loradML. To run steppingstone, change `do_mcmc = TRUE` to `do_mcmc = FALSE` at the top of the _green5.Rev_ file and rerun it.
+
+## Running loradML
+
+To run loradML, simply invoke it in the same directory as the _loradml.conf_ file and the RevBayes parameter file. Specifying `--quiet` or `-q` on the command line results in minimal output. Specifying `--mcse` or `-m` on the command line triggers estimation of the Monte Carlo Standard Error (MCSE) using an Overlapping Batch Statistics (OBS) approach. In this case, the setting `tbratio` is used to determine the batch size relative to the sample size; a `tbratio` of 10 to 20 is recommended. If this results in a batch size less than 200, the program will refuse to run. Note that OBS is computationally intensive because estimating the MCSE requires estimation of the marginal likelihood potentially many thousands of times (once for each overlapping batch).
 
 Note that loradML can be used with virtually any Bayesian MCMC program. All that is required is that the program create a tab-delimited parameter sample file specifying the log posterior kernel (or the log-likelihood and log-prior) and containing a column for each parameter in the model.
-
-You can easily modify the _green5.Rev_ script to conduct a Steppingstone analysis, which will return a log marginal likelihood very close to the value reported by loradML. To run steppingstone, change `do_mcmc = TRUE` to `do_mcmc = FALSE` at the top of the _green5.Rev_ file and rerun it.
 
 
 
