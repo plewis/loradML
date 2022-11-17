@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <stdexcept>
 #include <vector>
 #include <map>
@@ -54,17 +55,18 @@ namespace loradML {
     };
 
     struct ColumnSpec {
-            enum column_t {       //   hex          bin  dec
-                ignore              = 0x00, // 00000000    0
-                iteration           = 0x01, // 00000001    1
-                posterior           = 0x02, // 00000010    2
-                unconstrained       = 0x04, // 00000100    4 (counts as parameter)
-                positive            = 0x08, // 00001000    8 (counts as parameter)
-                proportion          = 0x10, // 00010000   16 (counts as parameter)
-                simplex             = 0x20, // 00100000   32 (counts as parameter)
-                simplexfinal        = 0x40, // 01000000   64
-                unknown             = 0x80, // 10000000  128
-                parameter           = 0x3C  // 00111100   60
+            enum column_t {       //   dec              bin
+                ignore              =    0,  // 0 0000 0000
+                iteration           =    1,  // 0 0000 0001
+                posterior           =    2,  // 0 0000 0010
+                unconstrained       =    4,  // 0 0000 0100 (counts as parameter)
+                positive            =    8,  // 0 0000 1000 (counts as parameter)
+                correlation         =   16,  // 0 0001 0000 (counts as parameter)
+                proportion          =   32,  // 0 0010 0000 (counts as parameter)
+                simplex             =   64,  // 0 0100 0000 (counts as parameter)
+                simplexfinal        =  128,  // 0 1000 0000
+                unknown             =  256,  // 1 0000 0000
+                parameter           =  124   // 0 0111 1100
             };
             
             ColumnSpec() {
@@ -90,6 +92,9 @@ namespace loradML {
                 }
                 else if (t == "proportion") {
                     _coltype = proportion;
+                }
+                else if (t == "correlation") {
+                    _coltype = correlation;
                 }
                 else if (t == "simplex") {
                     _coltype = simplex;
@@ -271,16 +276,18 @@ namespace loradML {
             }
         }
     }
-    
+
+#if 0
     inline void LoRaDML::handleColSpecs() {
         _column_specifications.resize(_colspecs.size());
         vector<string> parts;
+        unsigned i = 0;
         for (auto spec : _colspecs) {
             trim(spec);
             split(parts, spec, boost::is_any_of(" "), token_compress_on);
             unsigned nparts = (unsigned)parts.size();
             if (nparts != 3) {
-                throw XLoRaDML(format("Expecting colspec to comprise 3 parts (column, type, and name), but found %d parts: \"%s\"") % nparts % spec);
+                throw XLoRaDML(format("Expecting colspec to comprise 3 parts (type and name), but found %d parts: \"%s\"") % nparts % spec);
             }
             unsigned i = stoi(parts[0]) - 1;
             assert(_column_specifications[i]._coltype == ColumnSpec::unknown);
@@ -289,7 +296,27 @@ namespace loradML {
                 throw XLoRaDML(format("colspec named \"%s\" specified an unknown column type (%s)") % parts[2] % parts[1]);
         }
     }
-    
+#else
+    inline void LoRaDML::handleColSpecs() {
+        _column_specifications.resize(_colspecs.size());
+        vector<string> parts;
+        unsigned i = 0;
+        for (auto spec : _colspecs) {
+            trim(spec);
+            split(parts, spec, boost::is_any_of(" "), token_compress_on);
+            unsigned nparts = (unsigned)parts.size();
+            if (nparts != 2) {
+                throw XLoRaDML(format("Expecting colspec to comprise 2 parts (column, type, and name), but found %d parts: \"%s\"") % nparts % spec);
+            }
+            assert(_column_specifications[i]._coltype == ColumnSpec::unknown);
+            _column_specifications[i] = ColumnSpec(parts[0], parts[1]);
+            if (_column_specifications[i]._coltype == ColumnSpec::unknown)
+                throw XLoRaDML(format("colspec named \"%s\" specified an unknown column type (%s)") % parts[1] % parts[0]);
+            ++i;
+        }
+    }
+#endif
+
     inline double LoRaDML::calcLogSum(const std::vector<double> & logx_vect) {
         double max_logx = *(max_element(logx_vect.begin(), logx_vect.end()));
         double sum_terms = 0.0;
@@ -301,6 +328,10 @@ namespace loradML {
     }
     
     inline void LoRaDML::readParamFile() {
+        bool param_file_exists = boost::filesystem::exists(_param_file);
+        if (!param_file_exists)
+            throw XLoRaDML(format("Could not find the specified paramfile (\"%s\")") % _param_file);
+            
         if (!_quiet) {
             ::om.outputConsole("\nReading parameter sample file...\n");
         }
@@ -439,7 +470,7 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         
-                        // Peform logit transformation
+                        // Perform logit transformation
                         double logitp = log(p) - log(1.0 - p);
                         
                         // Add the log-Jacobian to the kernel
@@ -450,6 +481,32 @@ namespace loradML {
 
                         if (_debug_transformations)
                             ::om.outputConsole(format("%12.5f %12.5f %12.5f proportion (\"%s\") (kernel is now %g)\n") % (log(p) + log(1.0 - p)) % p % logitp % cspec._name % kernel);
+                    }
+                    else if (cspec._coltype == ColumnSpec::correlation) {
+                        double r = 0.0;
+                        try {
+                            r = stod(tmp[col]);
+                            if (r <= -1.0)
+                                throw runtime_error("expecting parameter value in interval (-1,1)");
+                            if (r >= 1.0)
+                                throw runtime_error("expecting parameter value in interval (-1,1)");
+                        }
+                        catch(...) {
+                            throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
+                        }
+                        
+                        // Perform transformation (-1,1) -> (-infty,+infty)
+                        double logrstar = log(1.0 + r) - log(1.0 - r);
+                        
+                        // Add the log-Jacobian to the kernel
+                        kernel += log(1.0 + r);
+                        kernel += log(1.0 - r);
+                        kernel -= log(2.0);
+                        
+                        tmp_param_vect[param++] = logrstar;
+
+                        if (_debug_transformations)
+                            ::om.outputConsole(format("%12.5f %12.5f %12.5f correlation (\"%s\") (kernel is now %g)\n") % (log(1.0 + r) + log(1.0 - r) - log(2.0)) % r % logrstar % cspec._name % kernel);
                     }
                     else if (cspec._coltype == ColumnSpec::simplex) {
                         double v = 0.0;
@@ -541,11 +598,11 @@ namespace loradML {
             throw XLoRaDML("  File seems to be empty or does not comprise columns of numbers");
         }
         if (!_quiet) {
-            ::om.outputConsole(format("  Processed %d column specifications\n") % _colspecs.size());
-            ::om.outputConsole(format("  Found %d parameters\n") % _nparameters);
-            ::om.outputConsole(format("  Found %d columns\n") % _column_names.size());
-            ::om.outputConsole(format("  File has %d lines\n") % i);
-            ::om.outputConsole(format("  Found %d values for each column\n") % _orig_iter.size());
+            ::om.outputConsole(format("  Processed %d column specification%s\n") % _colspecs.size() % (_colspecs.size() == 1 ? "s" : ""));
+            ::om.outputConsole(format("  Found %d parameter%s\n") % _nparameters % (_nparameters == 1 ? "s" : ""));
+            ::om.outputConsole(format("  Found %d column%s\n") % _column_names.size() % (_column_names.size() == 1 ? "s" : ""));
+            ::om.outputConsole(format("  File has %d line%s\n") % i % (i == 1 ? "s" : ""));
+            ::om.outputConsole(format("  Found %d value%s for each column\n") % _orig_iter.size() % (_orig_iter.size() == 1 ? "s" : ""));
         }
     }
     
@@ -801,6 +858,8 @@ namespace loradML {
         calcMarginalLikelihood();
 
         if (_mcse) {
+            chrono::steady_clock::time_point mcse_begin = chrono::steady_clock::now();
+
             if (!_quiet) {
                 double fT = (float)_T;
                 double fB = (float)_B;
@@ -815,13 +874,18 @@ namespace loradML {
             
             vector<double> eta(_nbatches, 0.0);
             
-            //::om.outputConsole("\nCalculating MCSE...\n", true);
+            bool progress_header_shown = false;
             for (unsigned b = 0; b < _nbatches; b++) {
-                //unsigned b1 = b + 1;
-                //if (b1 % 1000 == 0) {
-                //    double bpct = 100.0*b1/_nbatches;
-                //    ::om.outputConsole(format("%12d of %d (%.1f%%)\n") % b1 % _nbatches % bpct, true);
-                //}
+                chrono::steady_clock::time_point mcse_now = chrono::steady_clock::now();
+                unsigned secs = (unsigned)chrono::duration_cast<chrono::seconds>(mcse_now - mcse_begin).count();
+                if (secs > 30) {
+                    if (!progress_header_shown)
+                        ::om.outputConsole("\nProgress...\n", true);
+                    double bpct = 100.0*(b + 1)/_nbatches;
+                    ::om.outputConsole(format("%12d of %d (%.1f%%)\n") % (b + 1) % _nbatches % bpct, true);
+                    mcse_begin = chrono::steady_clock::now();
+                    progress_header_shown = true;
+                }
                 unsigned start_at = _first_index + b;
                 unsigned end_at = start_at + _B;
                 

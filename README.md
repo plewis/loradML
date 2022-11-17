@@ -55,42 +55,42 @@ startsample = 2
 trainingfrac = 0.5
 coverage = 0.5
 
-colspec=  1 iteration    Iteration	
-colspec=  2 posterior    Posterior	
-colspec=  3 ignore       Likelihood	
-colspec=  4 ignore       Prior	
-colspec=  5 ignore       alpha	
-colspec=  6 simplex      edge_length_proportion	
-colspec=  7 simplex      edge_length_proportion	
-colspec=  8 simplex      edge_length_proportion	
-colspec=  9 simplex      edge_length_proportion	
-colspec= 10 simplex      edge_length_proportion	
-colspec= 11 simplex      edge_length_proportion	
-colspec= 12 simplexfinal edge_length_proportion	
-colspec= 13 ignore       edgelen	
-colspec= 14 ignore       edgelen	
-colspec= 15 ignore       edgelen	
-colspec= 16 ignore       edgelen	
-colspec= 17 ignore       edgelen	
-colspec= 18 ignore       edgelen	
-colspec= 19 ignore       edgelen	
-colspec= 20 simplex      exchangeability
-colspec= 21 simplex      exchangeability
-colspec= 22 simplex      exchangeability
-colspec= 23 simplex      exchangeability
-colspec= 24 simplex      exchangeability
-colspec= 25 simplexfinal exchangeability	
-colspec= 26 simplex      basefreq	
-colspec= 27 simplex      basefreq	
-colspec= 28 simplex      basefreq	
-colspec= 29 simplexfinal basefreq	
-colspec= 30 proportion   pinvar	
-colspec= 31 positive     ratevar	
-colspec= 32 ignore       site_rate	
-colspec= 33 ignore       site_rate	
-colspec= 34 ignore       site_rate	
-colspec= 35 ignore       site_rate	
-colspec= 36 positive     tree_length	
+colspec=  iteration    Iteration	
+colspec=  posterior    Posterior	
+colspec=  ignore       Likelihood	
+colspec=  ignore       Prior	
+colspec=  ignore       alpha	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplex      edge_length_proportion	
+colspec=  simplexfinal edge_length_proportion	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  ignore       edgelen	
+colspec=  simplex      exchangeability
+colspec=  simplex      exchangeability
+colspec=  simplex      exchangeability
+colspec=  simplex      exchangeability
+colspec=  simplex      exchangeability
+colspec=  simplexfinal exchangeability	
+colspec=  simplex      basefreq	
+colspec=  simplex      basefreq	
+colspec=  simplex      basefreq	
+colspec=  simplexfinal basefreq	
+colspec=  proportion   pinvar	
+colspec=  positive     ratevar	
+colspec=  ignore       site_rate	
+colspec=  ignore       site_rate	
+colspec=  ignore       site_rate	
+colspec=  ignore       site_rate	
+colspec=  positive     tree_length	
 ```
 
 The first line is straightforward, specifying the name of the sample file to process as the setting `paramfile`. 
@@ -99,7 +99,7 @@ The `startsample` setting says to start with the second sample (the first sample
 
 I will talk about the settings `trainingfrac` and `coverage` after explaining the `colspec` entries.
 
-The LoRaD method requires all parameters to be unconstrained (i.e. their support should be the entire real line), so we need to tell loradML what the support is for each parameter in the model so that it can transform those that are constrained (for example, tree length is constrained to the positive half of the real line). There are 36 `colspec` entries, one for each column in the `paramfile`. Each `colspec` entry comprises a column index (starting at 1 for the first column in the file) followed (after some whitespace) by a column type and then (after more whitespace) by a label.
+The LoRaD method requires all parameters to be unconstrained (i.e. their support should be the entire real line), so we need to tell loradML what the support is for each parameter in the model so that it can transform those that are constrained (for example, tree length is constrained to the positive half of the real line). There are 36 `colspec` entries, one for each column in the `paramfile`. Each `colspec` entry comprises a column type and a label separated by whitespace. Note that there should be one `colspec` entry for every column and the order of `colspec` entries should match the ordering of the columns.
 
 The column type should be one of these values:
 
