@@ -33,12 +33,12 @@ How many parameters are there?
 
 No. free parameters | Parameter variable
 :-----------------: | :-------------------:
-         1          | tree_length
-         6          | edge_length_proportions
-         3          | freq
-         5          | er
-         1          | ratevar
-         1          | pinvar
+1                   | tree_length
+6                   | edge_length_proportions
+3                   | freq
+5                   | er
+1                   | ratevar
+1                   | pinvar
          
 In total, there are 17 free parameters in this model. Note that there are 7 edges in the ML tree but we only count 6 edge length proportions because, being proportions, these are constrained to sum to 1. Likewise, we only count 3 and 5 free parameters for the 4 nucleotide relative frequencies and the 6 exchangeabilities, respectively. Tree topology does not enter into the equation because our RevBayes script assumes that the topology is fixed to the ML topology.
 
