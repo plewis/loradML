@@ -25,6 +25,140 @@ using namespace boost;
 
 namespace loradML {
 
+#if defined(GHM)
+    struct RefDist {
+        string         _name;             // parameter name
+        unsigned       _dim;              // dimension of workspace
+        unsigned       _n;                // number of parameters (or parameter vectors) processed
+        unsigned       _i;                // index of next value to add
+        int            _first;            // index of first column associated with this RefDist
+        int            _last;             // index of last column associated with this RefDist
+        vector<double> _sums;             // summary across rows of data matrix
+        vector<double> _sum_of_squares;   // summary across rows of data matrix
+        vector<double> _parameters;       // parameters of the reference distribution
+                                          // If _dim == 1, holds mean and variance of Gamma reference distribution
+                                          // If _dim in [3,4,6,12,61], holds parameters of a Dirichlet reference distribution
+        string         _parameter_string; // comma-separated list of parameters in form of a string for reporting purposes
+
+        RefDist() : _dim(0), _n(0), _i(0), _first(-1), _last(-1) {}
+        
+        void setDimension(unsigned dim) {
+            assert(dim > 0 && dim <= 61);
+            _dim = dim;
+            _sums.resize(_dim);
+            _sum_of_squares.resize(_dim);
+            if (dim == 1)
+                _parameters.resize(2);
+            else
+                _parameters.resize(dim);
+            resetAll();
+        }
+        
+        void addCol(double c) {
+            if (_first < 0 || c < _first)
+                _first = c;
+            if (_last < 0 || c > _last)
+                _last = c;
+        }
+        
+        void addValue(double x) {
+            assert(_i < _dim);
+            _sums[_i] += x;
+            _sum_of_squares[_i] += x*x;
+            _i++;
+        }
+        
+        void processSampledParameter() {
+            _n++;
+            _i = 0;
+        }
+                
+        void resetAll() {
+            assert(_dim > 0);
+            _i = 0;
+            _sums.assign(_dim, 0.0);
+            _sum_of_squares.assign(_dim, 0.0);
+            if (_dim == 1)
+                _parameters.assign(2, 0.0);
+            else
+                _parameters.resize(_dim, 0.0);
+        }
+        
+        void calcParams() {
+            assert(_dim > 0);
+            assert(_n > 1);
+            if (_dim == 1) {
+                // Gamma reference distribution
+                double mean     = _sums[0]/_n;
+                double variance = (_sum_of_squares[0] - mean*mean*_n)/(_n-1);
+                // variance = shape*scale*scale
+                // mean     = shape*scale
+                double scale = variance/mean;
+                double shape = mean/scale;
+                assert(_parameters.size() == 2);
+                _parameters[0] = shape;
+                _parameters[1] = scale;
+                _parameter_string = str(format("%.5f,%.5f") % shape % scale);
+            }
+            else {
+                // Dirichlet reference distribution
+                // Ming-Hui Chen's method of matching component variances
+                // mu_i = phi_i/phi is mean of component i (estimate using sample mean)
+                // s_i^2 is sample variance of component i
+                //
+                //       sum_i mu_i^2 (1 - mu_i)^2
+                // phi = --------------------------- - 1
+                //       sum_i s_i^2 mu_i (1 - mu_i)
+                //
+                // phi_i = phi mu_i
+                assert(_n > 1);
+                vector<double> mean(_dim, 0.0);
+                double numerator = 0.0;
+                double denominator = 0.0;
+                for (unsigned i = 0; i < _dim; i++) {
+                    double m = _sums[i]/_n;
+                    double v = (_sum_of_squares[i] - m*m*_n)/(_n-1);
+                    numerator   += m*m*(1.0 - m)*(1.0 - m);
+                    denominator += v*m*(1.0 - m);
+                    mean[i] = m;
+                }
+                double phi = numerator/denominator - 1.0;
+                assert(_parameters.size() == _dim);
+                vector<string> _param_str_vect(_dim);
+                for (unsigned i = 0; i < _dim; i++) {
+                    _parameters[i] = mean[i]*phi;
+                    _param_str_vect[i] = str(format("%.5f") % _parameters[i]);
+                }
+                _parameter_string = algorithm::join(_param_str_vect, ",");
+            }
+        }
+        
+        double calcLogProbDensity(double v) {
+            // Return log of the Gamma(shape, scale) probability density for the supplied value v
+            assert(_dim == 1);
+            assert(_parameters.size() == 2);
+            double a = _parameters[0];
+            double b = _parameters[1];
+            double logp = (a - 1.0)*log(v) - v/b - a*log(b) -lgamma(a);
+            return logp;
+        }
+        
+        double calcLogProbDensity(vector<double> & v) {
+            // Return log of the Dirichlet probability density for the supplied vector v
+            assert(_dim == v.size());
+            double logp = 0.0;
+            double param_sum = 0.0;
+            for (unsigned i = 0; i < _dim; i++) {
+                param_sum += _parameters[i];
+                logp += (_parameters[i] - 1.0)*log(v[i]) - lgamma(_parameters[i]);
+            }
+            logp += lgamma(param_sum);
+            return logp;
+        }
+        
+    };
+#endif
+
     struct ParameterSample {
         unsigned         _iteration;    // original iteration that produced this sample point
         unsigned         _index;        // index before sorting by norm
@@ -136,6 +270,10 @@ namespace loradML {
             void                        standardizeParameters();
             double                      calcMarginalLikelihood(bool verbose = true);
             
+#if defined(GHM)
+            double                      doGHM();
+#endif
+            
             bool                        _quiet;
             bool                        _debug_transformations;
                         
@@ -181,7 +319,7 @@ namespace loradML {
             unsigned                    _nbatches; // number of batches
             double                      _TBratio;  // ratio of sample size (T) to batch size (B)
             unsigned                    _minimum_batch_size;
-        
+
             // Related to reading in the parameter file
             string                      _param_file;            // paramfile in loradML.conf
             vector<string>              _colspecs;              // vector of colspec entries from loradML.conf
@@ -191,6 +329,14 @@ namespace loradML {
             vector<double>              _kernel_values;     // element i is the log-kernel of the ith sample
             vector< vector<double> >    _parameter_vectors; // element i is the ith sampled parameter vector
             
+#if defined(GHM)
+            bool                        _ghm;   // estimate marginal likelihood using GHM
+            unsigned                    _ghm_nparameters;
+            vector< string >            _ghm_parameter_names;
+            vector<double>              _ghm_kernel_values; // untransformed log posterior kernel
+            vector< vector<double> >    _ghm_parameter_vectors; // untransformed parameter vectors
+#endif
+
             // Program name and version
             static string               _program_name;
             static unsigned             _major_version;
@@ -233,6 +379,9 @@ namespace loradML {
             ("coverage,c", program_options::value(&_coverage)->default_value(0.25), "fraction of training sample to use for determining rmax")
             ("mcse,m", program_options::bool_switch(&_mcse), "if specified, use overlapping batch statistics to estimate Monte Carlo standard error.")
             ("tbratio", program_options::value(&_TBratio)->default_value(10.0), "ratio of total sample size to (overlapping) batch sample size (e.g. 10.0) for estimating Monte Carlo standard error.")
+#if defined(GHM)
+            ("ghm", program_options::bool_switch(&_ghm), "if specified, estimate marginal likelihood using Generalized Harmonic Mean method (Note: ad hoc).")
+#endif
         ;
         program_options::store(program_options::parse_command_line(argc, argv, desc), vm);
         try {
@@ -277,26 +426,6 @@ namespace loradML {
         }
     }
 
-#if 0
-    inline void LoRaDML::handleColSpecs() {
-        _column_specifications.resize(_colspecs.size());
-        vector<string> parts;
-        unsigned i = 0;
-        for (auto spec : _colspecs) {
-            trim(spec);
-            split(parts, spec, boost::is_any_of(" "), token_compress_on);
-            unsigned nparts = (unsigned)parts.size();
-            if (nparts != 3) {
-                throw XLoRaDML(format("Expecting colspec to comprise 3 parts (type and name), but found %d parts: \"%s\"") % nparts % spec);
-            }
-            unsigned i = stoi(parts[0]) - 1;
-            assert(_column_specifications[i]._coltype == ColumnSpec::unknown);
-            _column_specifications[i] = ColumnSpec(parts[1], parts[2]);
-            if (_column_specifications[i]._coltype == ColumnSpec::unknown)
-                throw XLoRaDML(format("colspec named \"%s\" specified an unknown column type (%s)") % parts[2] % parts[1]);
-        }
-    }
-#else
     inline void LoRaDML::handleColSpecs() {
         _column_specifications.resize(_colspecs.size());
         vector<string> parts;
@@ -315,7 +444,6 @@ namespace loradML {
             ++i;
         }
     }
-#endif
 
     inline double LoRaDML::calcLogSum(const std::vector<double> & logx_vect) {
         double max_logx = *(max_element(logx_vect.begin(), logx_vect.end()));
@@ -341,12 +469,20 @@ namespace loradML {
         _kernel_values.clear();
         _parameter_vectors.clear();
         
+#if defined(GHM)
+        _ghm_parameter_names.clear();
+        _ghm_kernel_values.clear();
+        _ghm_parameter_vectors.clear();
+#endif
+        
         // Read the file
         ifstream inf(_param_file);
         string line;
         vector<string> tmp;
         vector<double> tmp_param_vect;
-        //map<string, vector<double> > simplex_workspace;
+#if defined(GHM)
+        vector<double> ghm_param_vect;
+#endif
         vector<double> simplex_workspace;
         unsigned i = 0;
         while (getline(inf, line)) {
@@ -361,6 +497,17 @@ namespace loradML {
                         ++_nparameters;
                 }
                 tmp_param_vect.resize(_nparameters);
+
+#if defined(GHM)
+                _ghm_nparameters = 0;
+                for (auto & cspec : _column_specifications) {
+                    if (cspec.isParameter() || cspec._coltype == ColumnSpec::simplexfinal) {
+                        ++_ghm_nparameters;
+                        _ghm_parameter_names.push_back(cspec._name);
+                    }
+                }
+                ghm_param_vect.resize(_ghm_nparameters);
+#endif
                 
                 // Ensure that there is a simplexfinal colspec ending each run of simplex colspecs
                 bool in_simplex = false;
@@ -387,12 +534,21 @@ namespace loradML {
                 trim(line);
                 split(tmp, line, boost::is_any_of("\t"));
                 
+                if (tmp.size() != _column_specifications.size()) {
+                    throw XLoRaDML(format("Number of columns (%d) does not match number of colspec entries (%d)") % tmp.size() % _column_specifications.size());
+                }
+                
                 // Initializations
                 unsigned col      = 0;    // index of column in parameter file
                 unsigned param    = 0;    // index of parameter in parameter vector
                 unsigned origiter = 0;    // original iteration of sample
                 double   kernel   = 0.0;  // posterior kernel value from parameter file
                 
+#if defined(GHM)
+                double   ghm_kernel = 0.0; // untransformed posterior kernel value from parameter file
+                unsigned ghm_param = 0;
+#endif
+                                        
                 // Go through each column spec and column, pulling out information for this sample
                 for (auto & cspec : _column_specifications) {
                     if (cspec._coltype == ColumnSpec::iteration) {
@@ -418,6 +574,10 @@ namespace loradML {
                         }
                         kernel += v;
 
+#if defined(GHM)
+                        ghm_kernel += v;
+#endif
+
                         if (_debug_transformations)
                             ::om.outputConsole(format("%12.5f %12s %12s log-posterior (kernel is now %g)\n") % v % "" % "" % kernel);
                     }
@@ -430,6 +590,9 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         tmp_param_vect[param++] = v;
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = v;
+#endif
                         
                         if (_debug_transformations) {
                             ::om.outputConsole(format("%12.5f %12.5f %12.5f unconstrained (\"%s\") (kernel is now %g)\n") % 0.0 % v % v % cspec._name % kernel);
@@ -439,13 +602,18 @@ namespace loradML {
                         double v = 0.0;
                         try {
                             v = stod(tmp[col]);
-                            if (v <= 0.0)
-                                throw runtime_error("expecting strictly postive parameter value");
                         }
                         catch(...) {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
+                        if (v <= 0.0) {
+                            throw XLoRaDML(format("in line %d, was expecting strictly positive parameter value in column \"%s\", but found %g instead") % (i+1) % cspec._name % v);
+                        }
                         
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = v;
+#endif
+
                         // Peform log transformation
                         double logv = log(v);
                         
@@ -470,6 +638,10 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = p;
+#endif
+
                         // Perform logit transformation
                         double logitp = log(p) - log(1.0 - p);
                         
@@ -495,6 +667,10 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = r;
+#endif
+
                         // Perform transformation (-1,1) -> (-infty,+infty)
                         double logrstar = log(1.0 + r) - log(1.0 - r);
                         
@@ -521,6 +697,10 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
 
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = v;
+#endif
+
                         // Add value to simplex_workspace vector having key equal to cspec._name
                         //simplex_workspace[cspec._name].push_back(v);
                         simplex_workspace.push_back(v);
@@ -538,6 +718,10 @@ namespace loradML {
                             throw XLoRaDML(format("in line %d, could not convert string \"%s\" in column %d to a floating-point parameter value") % (i+1) % tmp[col] % col);
                         }
                         
+#if defined(GHM)
+                        ghm_param_vect[ghm_param++] = finalv;
+#endif
+
                         // Ensure that sum is within 0.0001 of 1.0
                         //vector<double> & w = simplex_workspace[cspec._name];
                         //double simplex_sum = finalv + accumulate(w.begin(), w.end(), 0.0);
@@ -588,6 +772,11 @@ namespace loradML {
                 _orig_iter.push_back(origiter);
                 _kernel_values.push_back(kernel);
                 _parameter_vectors.push_back(tmp_param_vect);
+#if defined(GHM)
+                _ghm_kernel_values.push_back(ghm_kernel);
+                _ghm_parameter_vectors.push_back(ghm_param_vect);
+#endif
+                
             }
             
             ++i;
@@ -757,7 +946,7 @@ namespace loradML {
         // standard normal density as the reference
         double log_mvnorm_constant = 0.5*p*log(2.*M_PI) + 1.0*p*log(sigma);
         std::vector<double> log_ratios;
-        //std::vector<double> log_inv_ratios;
+        std::vector<double> log_inv_ratios;
         unsigned nestimation = (unsigned)_estimation_sample.size();
         for (unsigned i = 0; i < nestimation; ++i) {
             double norm = _estimation_sample[i]._norm;
@@ -767,25 +956,31 @@ namespace loradML {
             double log_reference = -0.5*sigma_squared*pow(norm,2.0) - log_mvnorm_constant;
             double log_ratio = log_reference - log_kernel;
             log_ratios.push_back(log_ratio);
-            //log_inv_ratios.push_back(-1.0*log_ratio);
+            if (verbose)
+                log_inv_ratios.push_back(-1.0*log_ratio);
         }
         
         if (log_ratios.size() == 0) {
             throw XLoRaDML("Zero samples fall inside working parameter space; try increasing coverage fraction");
         }
         double log_sum_ratios = calcLogSum(log_ratios);
-        //double log_sum_inv_ratios = calcLogSum(log_inv_ratios);
         double log_marginal_likelihood = log_Delta - (log_sum_ratios - log(nestimation));
+
+        if (verbose) {
+            double log_sum_inv_ratios = calcLogSum(log_inv_ratios);
+            double ghmstar = log_sum_inv_ratios - log(nestimation);
+            ::om.outputConsole(format("  GHM* estimator is %.5f\n") % ghmstar);
+        }
         
         if (!_quiet) {
             ::om.outputConsole(format("  Number of samples used is %d\n") % log_ratios.size());
             ::om.outputConsole(format("  Nominal coverage is %.5f\n") % _coverage);
             ::om.outputConsole(format("  Actual coverage is %.5f\n") % (1.0*log_ratios.size()/nestimation));
-            //::om.outputConsole(format("  avg. log inv. ratio estimator = %.5f\n") % (log_sum_inv_ratios - log(nestimation)));
         }
         
-        if (verbose)
+        if (verbose) {
             ::om.outputConsole(format("  Log marginal likelihood is %.5f\n") % log_marginal_likelihood);
+        }
             
         return log_marginal_likelihood;
     }
@@ -830,6 +1025,276 @@ namespace loradML {
         }
     }
     
+#if defined(GHM)
+    inline double LoRaDML::doGHM() {
+        // This function is ad hoc and the presence of unconstrained colspecs means it is not being used
+        // for the purpose for which it was designed
+        for (auto & cspec : _column_specifications) {
+            if (cspec._coltype == ColumnSpec::unconstrained)
+                throw XLoRaDML("ghm cannot be computed if there are unconstrained parameters");
+        }
+    
+        // Create reference distribution objects for all parameters that could be present in the four partitioning
+        // models (unpart, bygene, bycodon, and byboth) for the 4-gene cicada example used in the Wang et al. paper
+        RefDist         edgeprop;
+        RefDist         treelen;
+        RefDist         relrate;
+        vector<RefDist> basefreq(12);
+        vector<RefDist> exchange(12);
+        vector<RefDist> ratevar(12);
+        unsigned nrows = (unsigned)_ghm_parameter_vectors.size();
+        unsigned ncols = (unsigned)_ghm_parameter_names.size();
+
+        // Create a vector of references to RefDist objects so that we don't have to examine parameter names
+        // to parse each row of the data matrix
+        vector<RefDist *> refdists;
+        set<RefDist *> refdists_used;
+        vector<string> parts;
+        for (unsigned col = 0; col < ncols; col++) {
+            string nm = _ghm_parameter_names[col];
+            if (nm == "TL") {
+                assert(treelen._dim == 0 || treelen._dim == 1);
+                if (treelen._dim == 0) {
+                    treelen._name = "tree_length";
+                    treelen.setDimension(1);
+                }
+                treelen.addCol(col);
+                refdists.push_back(&treelen);
+                refdists_used.insert(&treelen);
+            }
+            else if (algorithm::contains(nm, "edgeProp") || algorithm::contains(nm, "edgeLen")) {
+                // Note: "edgeLen" changed to "edgeProp" but need to handle legacy cases
+                assert(edgeprop._dim == 0 || edgeprop._dim == 61);
+                if (edgeprop._dim == 0) {
+                    edgeprop._name = "edge_proportions";
+                    edgeprop.setDimension(61);
+                }
+                edgeprop.addCol(col);
+                refdists.push_back(&edgeprop);
+                refdists_used.insert(&edgeprop);
+            }
+            else if (algorithm::contains(nm, "rAC")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "rAG")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "rAT")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "rCG")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "rCT")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "rGT")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(exchange[which]._dim == 0 || exchange[which]._dim == 6);
+                if (exchange[which]._dim == 0) {
+                    exchange[which]._name = str(format("exchangeabilities-%d") % which);
+                    exchange[which].setDimension(6);
+                }
+                exchange[which].addCol(col);
+                refdists.push_back(&exchange[which]);
+                refdists_used.insert(&exchange[which]);
+            }
+            else if (algorithm::contains(nm, "piA")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(basefreq[which]._dim == 0 || basefreq[which]._dim == 4);
+                if (basefreq[which]._dim == 0) {
+                    basefreq[which]._name = str(format("basefreqs-%d") % which);
+                    basefreq[which].setDimension(4);
+                }
+                basefreq[which].addCol(col);
+                refdists.push_back(&basefreq[which]);
+                refdists_used.insert(&basefreq[which]);
+            }
+            else if (algorithm::contains(nm, "piC")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(basefreq[which]._dim == 0 || basefreq[which]._dim == 4);
+                if (basefreq[which]._dim == 0) {
+                    basefreq[which]._name = str(format("basefreqs-%d") % which);
+                    basefreq[which].setDimension(4);
+                }
+                basefreq[which].addCol(col);
+                refdists.push_back(&basefreq[which]);
+                refdists_used.insert(&basefreq[which]);
+            }
+            else if (algorithm::contains(nm, "piG")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(basefreq[which]._dim == 0 || basefreq[which]._dim == 4);
+                if (basefreq[which]._dim == 0) {
+                    basefreq[which]._name = str(format("basefreqs-%d") % which);
+                    basefreq[which].setDimension(4);
+                }
+                basefreq[which].addCol(col);
+                refdists.push_back(&basefreq[which]);
+                refdists_used.insert(&basefreq[which]);
+            }
+            else if (algorithm::contains(nm, "piT")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(basefreq[which]._dim == 0 || basefreq[which]._dim == 4);
+                if (basefreq[which]._dim == 0) {
+                    basefreq[which]._name = str(format("basefreqs-%d") % which);
+                    basefreq[which].setDimension(4);
+                }
+                basefreq[which].addCol(col);
+                refdists.push_back(&basefreq[which]);
+                refdists_used.insert(&basefreq[which]);
+            }
+            else if (algorithm::contains(nm, "ratevar")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(ratevar[which]._dim == 0 || ratevar[which]._dim == 1);
+                if (ratevar[which]._dim == 0) {
+                    ratevar[which]._name = str(format("ratevar-%d") % which);
+                    ratevar[which].setDimension(1);
+                }
+                ratevar[which].addCol(col);
+                refdists.push_back(&ratevar[which]);
+                refdists_used.insert(&ratevar[which]);
+            }
+            else if (algorithm::contains(nm, "relrate")) {
+                split(parts, nm, boost::is_any_of("-"));
+                unsigned which = stoi(parts[1]);
+                assert(relrate._dim <= 12);
+                if (relrate._dim == 0)
+                    relrate._name = "subset_relrates";
+                if (relrate._dim < which)
+                    relrate.setDimension(which);
+                relrate.addCol(col);
+                refdists.push_back(&relrate);
+                refdists_used.insert(&relrate);
+            }
+            else {
+                throw XLoRaDML(format("GHM cannot be calculated because column name \"%s\" was unexpected") % nm);
+            }
+        }
+        
+        // Accumulate sums and sum of squares over all rows of the data matrix
+        for (unsigned row = 0; row < nrows; row++) {
+            // Increment _n and reset the element index _i to zero for each RefDist object used
+            for (auto refdist : refdists_used) {
+                refdist->processSampledParameter();
+            }
+            
+            // Add parameter values to the appropriate RefDist object
+            for (unsigned col = 0; col < ncols; col++) {
+                double x = _ghm_parameter_vectors[row][col];
+                refdists[col]->addValue(x);
+            }
+        }
+        
+        if (!_quiet) {
+            ::om.outputConsole("\nReference distributions:\n");
+        }
+        
+        for (auto refdist : refdists_used) {
+            refdist->calcParams();
+            if (!_quiet) {
+                ::om.outputConsole(format("  %s (%d-%d): %s\n") % refdist->_name % refdist->_first % refdist->_last % refdist->_parameter_string);
+            }
+        }
+        
+        if (!_quiet) {
+            ::om.outputConsole("\nComputing GHM estimate...\n");
+        }
+        
+        vector<double> log_ratios;
+        for (unsigned row = 0; row < nrows; row++) {
+            double logK = _ghm_kernel_values[row];
+            
+            // Compute log of the joint reference density
+            double logR = 0.0;
+            for (auto refdist : refdists_used) {
+                if (refdist->_dim == 1) {
+                    assert(refdist->_first == refdist->_last && refdist->_first != -1);
+                    logR += refdist->calcLogProbDensity(_ghm_parameter_vectors[row][refdist->_first]);
+                }
+                else {
+                    assert(refdist->_first != -1 && refdist->_last != -1 && refdist->_first < refdist->_last);
+                    unsigned from = (unsigned)refdist->_first;
+                    unsigned to   = (unsigned)refdist->_last;
+                    assert(refdist->_dim == to - from + 1);
+                    vector<double> v(refdist->_dim);
+                    for (unsigned c = from; c <= to; c++) {
+                        v[c - from] = _ghm_parameter_vectors[row][c];
+                    }
+                    logR += refdist->calcLogProbDensity(v);
+                }
+            }
+            
+            double log_ratio = logR - logK; //@@@
+            log_ratios.push_back(log_ratio);
+        }
+        
+        // Compute the log of the sum of the saved log ratios (using floating point control)
+        unsigned n = (unsigned)log_ratios.size();
+        assert(n > 0);
+        double logmaxr = *std::max_element(log_ratios.begin(), log_ratios.end());
+        double sumexp = 0.0;
+        std::for_each(log_ratios.begin(), log_ratios.end(), [logmaxr,&sumexp](double logr){sumexp += exp(logr - logmaxr);});
+        assert(sumexp > 0.0);
+        
+        // Compute the GHM estimate
+        double log_inverse_marginal_likelihood = logmaxr + log(sumexp) - log(n);
+        double log_marginal_likelihood = -log_inverse_marginal_likelihood;
+
+        return log_marginal_likelihood;
+    }
+#endif
+
     inline void LoRaDML::run() {
         if (!_quiet) {
             ::om.outputConsole(format("This is %s (ver. %d.%d)\n") % _program_name % _major_version % _minor_version);
@@ -912,6 +1377,13 @@ namespace loradML {
             double MCSE = sqrt(mean_square);
             ::om.outputConsole(format("  MCSE is %.5f\n") % MCSE);
         }
+        
+#if defined(GHM)
+        if (_ghm) {
+            double logLghm = doGHM();
+            ::om.outputConsole(format("  GHM estimate is %.5f\n") % logLghm);
+        }
+#endif
     }
 
 }   // namespace loradML
